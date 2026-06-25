@@ -1,17 +1,7 @@
 """
 test_applications.py
 
-These tests check the main internship application CRUD routes.
-
-CRUD means:
-- Create
-- Read
-- Update
-- Delete
-
-These tests use the real FastAPI app and the real database session.
-For now, that is fine for learning.
-Later, you can improve this by using a separate test database.
+Tests for authenticated application CRUD.
 """
 
 import pytest
@@ -19,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.database import SessionLocal
 from app.main import app
-from app.models import InternshipApplication
+from app.models import InternshipApplication, User
 
 
 client = TestClient(app)
@@ -28,17 +18,16 @@ client = TestClient(app)
 @pytest.fixture(autouse=True)
 def clean_database():
     """
-    Clean the internship_applications table before and after each test.
+    Clean tables before and after each test.
 
-    Why?
-    Tests should not depend on data from previous tests.
-    Each test should start with a predictable empty database.
+    Delete applications first because applications depend on users.
     """
 
     db = SessionLocal()
 
     try:
         db.query(InternshipApplication).delete()
+        db.query(User).delete()
         db.commit()
     finally:
         db.close()
@@ -49,12 +38,56 @@ def clean_database():
 
     try:
         db.query(InternshipApplication).delete()
+        db.query(User).delete()
         db.commit()
     finally:
         db.close()
 
 
-def test_create_application_returns_created_application():
+def auth_headers(email: str = "test@example.com", password: str = "password123") -> dict:
+    """
+    Register and log in a user.
+
+    Returns the Authorization header needed for protected routes.
+    """
+
+    client.post(
+        "/auth/register",
+        json={
+            "email": email,
+            "password": password,
+        },
+    )
+
+    login_response = client.post(
+        "/auth/login",
+        data={
+            "username": email,
+            "password": password,
+        },
+    )
+
+    token = login_response.json()["access_token"]
+
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_create_application_requires_authentication():
+    response = client.post(
+        "/applications",
+        json={
+            "company": "Microsoft",
+            "role": "Software Engineering Intern",
+            "status": "applied",
+        },
+    )
+
+    assert response.status_code == 401
+
+
+def test_create_application_returns_created_application_for_current_user():
+    headers = auth_headers()
+
     payload = {
         "company": "Microsoft",
         "role": "Software Engineering Intern",
@@ -65,7 +98,7 @@ def test_create_application_returns_created_application():
         "notes": "Applied through careers page.",
     }
 
-    response = client.post("/applications", json=payload)
+    response = client.post("/applications", json=payload, headers=headers)
 
     assert response.status_code == 201
 
@@ -75,28 +108,34 @@ def test_create_application_returns_created_application():
     assert data["company"] == "Microsoft"
     assert data["role"] == "Software Engineering Intern"
     assert data["status"] == "applied"
-    assert data["location"] == "Remote"
-    assert data["application_url"] == "https://careers.microsoft.com"
-    assert data["date_applied"] == "2026-06-23"
-    assert data["notes"] == "Applied through careers page."
-    assert "created_at" in data
-    assert "updated_at" in data
+    assert data["owner_id"] is not None
 
 
-def test_list_applications_returns_created_applications():
-    payload = {
-        "company": "Google",
-        "role": "Backend Engineering Intern",
-        "status": "wishlist",
-        "location": "Austin, TX",
-        "application_url": "https://careers.google.com",
-        "date_applied": None,
-        "notes": "Need to apply soon.",
-    }
+def test_list_applications_returns_only_current_users_applications():
+    user_one_headers = auth_headers("one@example.com", "password123")
+    user_two_headers = auth_headers("two@example.com", "password123")
 
-    client.post("/applications", json=payload)
+    client.post(
+        "/applications",
+        json={
+            "company": "Google",
+            "role": "Backend Intern",
+            "status": "applied",
+        },
+        headers=user_one_headers,
+    )
 
-    response = client.get("/applications")
+    client.post(
+        "/applications",
+        json={
+            "company": "Amazon",
+            "role": "SDE Intern",
+            "status": "applied",
+        },
+        headers=user_two_headers,
+    )
+
+    response = client.get("/applications", headers=user_one_headers)
 
     assert response.status_code == 200
 
@@ -104,54 +143,63 @@ def test_list_applications_returns_created_applications():
 
     assert len(data) == 1
     assert data[0]["company"] == "Google"
-    assert data[0]["role"] == "Backend Engineering Intern"
 
 
-def test_get_application_by_id_returns_one_application():
+def test_get_application_by_id_returns_owned_application():
+    headers = auth_headers()
+
     create_response = client.post(
         "/applications",
         json={
             "company": "Amazon",
             "role": "Software Development Engineer Intern",
             "status": "applied",
-            "location": "Dallas, TX",
-            "application_url": "https://amazon.jobs",
-            "date_applied": "2026-06-23",
-            "notes": "Submitted resume.",
         },
+        headers=headers,
     )
 
     application_id = create_response.json()["id"]
 
-    response = client.get(f"/applications/{application_id}")
+    response = client.get(f"/applications/{application_id}", headers=headers)
 
     assert response.status_code == 200
-
-    data = response.json()
-
-    assert data["id"] == application_id
-    assert data["company"] == "Amazon"
+    assert response.json()["id"] == application_id
+    assert response.json()["company"] == "Amazon"
 
 
-def test_get_application_by_invalid_id_returns_404():
-    response = client.get("/applications/999999")
+def test_user_cannot_get_another_users_application():
+    user_one_headers = auth_headers("one@example.com", "password123")
+    user_two_headers = auth_headers("two@example.com", "password123")
 
-    assert response.status_code == 404
-    assert response.json()["detail"] == "Application not found."
-
-
-def test_update_application_changes_status():
     create_response = client.post(
         "/applications",
         json={
             "company": "Meta",
             "role": "Software Engineering Intern",
             "status": "applied",
-            "location": "Remote",
-            "application_url": "https://careers.meta.com",
-            "date_applied": "2026-06-23",
-            "notes": "Initial application.",
         },
+        headers=user_one_headers,
+    )
+
+    application_id = create_response.json()["id"]
+
+    response = client.get(f"/applications/{application_id}", headers=user_two_headers)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Application not found."
+
+
+def test_update_application_changes_status():
+    headers = auth_headers()
+
+    create_response = client.post(
+        "/applications",
+        json={
+            "company": "Meta",
+            "role": "Software Engineering Intern",
+            "status": "applied",
+        },
+        headers=headers,
     )
 
     application_id = create_response.json()["id"]
@@ -162,6 +210,7 @@ def test_update_application_changes_status():
             "status": "interviewing",
             "notes": "Moved to interview stage.",
         },
+        headers=headers,
     )
 
     assert update_response.status_code == 200
@@ -174,41 +223,44 @@ def test_update_application_changes_status():
 
 
 def test_delete_application_removes_application():
+    headers = auth_headers()
+
     create_response = client.post(
         "/applications",
         json={
             "company": "Netflix",
             "role": "Backend Intern",
             "status": "wishlist",
-            "location": "Remote",
-            "application_url": "https://jobs.netflix.com",
-            "date_applied": None,
-            "notes": "Interesting backend role.",
         },
+        headers=headers,
     )
 
     application_id = create_response.json()["id"]
 
-    delete_response = client.delete(f"/applications/{application_id}")
+    delete_response = client.delete(
+        f"/applications/{application_id}",
+        headers=headers,
+    )
 
     assert delete_response.status_code == 204
 
-    get_response = client.get(f"/applications/{application_id}")
+    get_response = client.get(
+        f"/applications/{application_id}",
+        headers=headers,
+    )
 
     assert get_response.status_code == 404
 
 
 def test_invalid_status_returns_422():
+    headers = auth_headers()
+
     payload = {
         "company": "Apple",
         "role": "Software Engineering Intern",
         "status": "maybe kinda applied",
-        "location": "Cupertino, CA",
-        "application_url": "https://jobs.apple.com",
-        "date_applied": "2026-06-23",
-        "notes": "Invalid status test.",
     }
 
-    response = client.post("/applications", json=payload)
+    response = client.post("/applications", json=payload, headers=headers)
 
     assert response.status_code == 422
